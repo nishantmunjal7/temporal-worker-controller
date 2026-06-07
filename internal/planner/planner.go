@@ -90,7 +90,7 @@ func GeneratePlan(
 
 	// Add delete/scale operations based on version status
 	plan.DeleteDeployments = getDeleteDeployments(k8sState, status, spec, foundDeploymentInTemporal)
-	plan.ScaleDeployments = getScaleDeployments(k8sState, status, spec)
+	plan.ScaleDeployments = getScaleDeployments(k8sState, status, spec, temporalState)
 	plan.ShouldCreateDeployment = shouldCreateDeployment(status, maxVersionsIneligibleForDeletion)
 	plan.UpdateDeployments = getUpdateDeployments(k8sState, status, spec, connection)
 
@@ -377,6 +377,7 @@ func getScaleDeployments(
 	k8sState *k8s.DeploymentState,
 	status *temporaliov1alpha1.TemporalWorkerDeploymentStatus,
 	spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec,
+	temporalState *temporal.TemporalWorkerState,
 ) map[*corev1.ObjectReference]uint32 {
 	scaleDeployments := make(map[*corev1.ObjectReference]uint32)
 	replicas := *spec.Replicas
@@ -436,6 +437,26 @@ func getScaleDeployments(
 			if d.Spec.Replicas != nil && *d.Spec.Replicas != replicas {
 				scaleDeployments[version.Deployment] = uint32(replicas)
 			}
+		case temporaliov1alpha1.VersionStatusDraining:
+			// A draining version is kept alive only so that pinned workflows
+			// still open on it can resume when they wake (e.g. a parent
+			// waiting on a long-running child workflow). Those wake-ups are
+			// rare and brief, so a single poller is sufficient. Without this
+			// case the deployment stays frozen at whatever replica count it
+			// had when it was superseded — e.g. 7-8 idle pods held for days
+			// behind one waiting workflow. Never scale to zero here: a pinned
+			// workflow with no live worker of its build can never resume.
+			//
+			// Only scale down when the version's task-queue backlog is known
+			// to be zero: a draining version can still be actively executing
+			// its pinned workflows' activities, in which case its current
+			// replica count is left untouched. An unknown backlog (nil) is
+			// treated conservatively the same way.
+			if backlog, ok := versionBacklog(temporalState, version.BuildID); ok && backlog == 0 {
+				if d.Spec.Replicas == nil || *d.Spec.Replicas > 1 {
+					scaleDeployments[version.Deployment] = 1
+				}
+			}
 		case temporaliov1alpha1.VersionStatusDrained:
 			if time.Since(version.DrainedSince.Time) > spec.SunsetStrategy.ScaledownDelay.Duration {
 				// TODO(jlegrone): Compute scale based on load? Or percentage of replicas?
@@ -448,6 +469,21 @@ func getScaleDeployments(
 	}
 
 	return scaleDeployments
+}
+
+
+// versionBacklog returns the approximate pending-task backlog collected for
+// a build ID, and whether it is known. Backlog is only collected for
+// Draining versions; everything else returns ok=false.
+func versionBacklog(temporalState *temporal.TemporalWorkerState, buildID string) (int64, bool) {
+	if temporalState == nil {
+		return 0, false
+	}
+	v, ok := temporalState.Versions[buildID]
+	if !ok || v == nil || v.Backlog == nil {
+		return 0, false
+	}
+	return *v.Backlog, true
 }
 
 // shouldCreateDeployment determines if a new deployment needs to be created

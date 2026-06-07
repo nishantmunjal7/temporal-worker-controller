@@ -787,7 +787,7 @@ func TestGetScaleDeployments(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			scales := getScaleDeployments(tc.k8sState, tc.status, tc.spec)
+			scales := getScaleDeployments(tc.k8sState, tc.status, tc.spec, tc.state)
 			assert.Equal(t, len(tc.expectScales), len(scales), "unexpected number of scales")
 			actualScaleDeploymentNames := make([]string, 0)
 			for deploymentRef, actualReplicas := range scales {

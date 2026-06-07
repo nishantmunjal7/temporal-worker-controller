@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
@@ -48,6 +49,12 @@ type VersionInfo struct {
 	// Only checked for Drained versions that don't have controller-managed Deployments.
 	// Used to compute status.VersionCountIneligibleForDeletion.
 	NoTaskQueuesHaveVersionedPoller bool
+
+	// Backlog is the approximate number of pending workflow + activity tasks
+	// across this version's task queues. Only collected for Draining versions
+	// (used by the planner to decide whether the version can be scaled down
+	// to a single poller). Nil means unknown / not collected.
+	Backlog *int64
 }
 
 // TemporalWorkerState represents the state of a worker deployment in Temporal
@@ -212,7 +219,108 @@ func GetWorkerDeploymentState(
 		state.Versions[version.Version.BuildId] = versionInfo
 	}
 
+	collectDrainingVersionBacklogs(ctx, client, deploymentHandler, state, k8sDeployments)
+
 	return state, nil
+}
+
+// backlogCollectionBudget bounds how long a single reconcile may spend
+// gathering draining-version backlogs. Backlog data is best-effort: when the
+// budget is exceeded the affected versions keep a nil (unknown) Backlog and
+// the planner conservatively leaves their replicas untouched until a later
+// reconcile succeeds.
+const backlogCollectionBudget = 2 * time.Second
+
+// collectDrainingVersionBacklogs fetches the approximate task backlog for
+// Draining versions so the planner can scale idle ones down to a single
+// poller. Fetches run in parallel under a shared time budget so they can
+// never stall the reconcile loop, and are skipped entirely for versions
+// whose deployment is already at <=1 replica (nothing to scale down).
+func collectDrainingVersionBacklogs(
+	ctx context.Context,
+	client temporalClient.Client,
+	deploymentHandler temporalClient.WorkerDeploymentHandle,
+	state *TemporalWorkerState,
+	k8sDeployments map[string]*appsv1.Deployment,
+) {
+	budgetCtx, cancel := context.WithTimeout(ctx, backlogCollectionBudget)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for buildID, versionInfo := range state.Versions {
+		if versionInfo.Status != temporaliov1alpha1.VersionStatusDraining {
+			continue
+		}
+		// Only relevant when there is something to scale down.
+		d, exists := k8sDeployments[buildID]
+		if !exists || d.Spec.Replicas == nil || *d.Spec.Replicas <= 1 {
+			continue
+		}
+
+		wg.Add(1)
+		go func(buildID string, vi *VersionInfo) {
+			defer wg.Done()
+			if backlog, err := getVersionBacklog(budgetCtx, client, deploymentHandler, buildID); err == nil {
+				vi.Backlog = &backlog
+			}
+		}(buildID, versionInfo)
+	}
+	wg.Wait()
+}
+
+// getVersionBacklog sums the approximate pending workflow + activity task
+// counts across all task queues of a specific worker deployment version.
+// Zero backlog means the version's pinned workflows are idle (e.g. waiting
+// on child workflows or timers) and the version can safely run on a single
+// poller while it drains.
+func getVersionBacklog(
+	ctx context.Context,
+	client temporalClient.Client,
+	deploymentHandler temporalClient.WorkerDeploymentHandle,
+	buildID string,
+) (int64, error) {
+	desc, err := deploymentHandler.DescribeVersion(ctx, temporalClient.WorkerDeploymentDescribeVersionOptions{
+		BuildID: buildID,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("unable to describe version %q: %w", buildID, err)
+	}
+
+	seen := make(map[string]struct{})
+	var total int64
+	for _, tq := range desc.Info.TaskQueuesInfos {
+		if _, ok := seen[tq.Name]; ok {
+			continue
+		}
+		seen[tq.Name] = struct{}{}
+
+		resp, err := client.DescribeTaskQueueEnhanced(ctx, temporalClient.DescribeTaskQueueEnhancedOptions{
+			TaskQueue:   tq.Name,
+			ReportStats: true,
+			Versions: &temporalClient.TaskQueueVersionSelection{
+				BuildIDs: []string{buildID},
+			},
+			TaskQueueTypes: []temporalClient.TaskQueueType{
+				temporalClient.TaskQueueTypeWorkflow,
+				temporalClient.TaskQueueTypeActivity,
+			},
+		})
+		if err != nil {
+			return 0, fmt.Errorf("unable to describe task queue %q: %w", tq.Name, err)
+		}
+		// VersionsInfo is deprecated in favor of VersioningInfo, but it is
+		// the only surface that exposes per-version TaskQueueStats
+		// (ApproximateBacklogCount) on this SDK version, and we query with
+		// an explicit version selection above.
+		for _, versionInfo := range resp.VersionsInfo { //nolint:staticcheck
+			for _, typeInfo := range versionInfo.TypesInfo {
+				if typeInfo.Stats != nil {
+					total += typeInfo.Stats.ApproximateBacklogCount
+				}
+			}
+		}
+	}
+	return total, nil
 }
 
 func withBackoff(timeout time.Duration, tick time.Duration, fn func() error) error {
